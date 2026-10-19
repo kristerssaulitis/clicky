@@ -103,6 +103,12 @@ enum ClickyAnalytics {
         ])
     }
 
+    /// The user dragged a circle around a screen region during push-to-talk;
+    /// the cropped region is attached to the prompt (circle-to-ask).
+    static func trackScreenRegionCircled() {
+        PostHogSDK.shared.capture("screen_region_circled")
+    }
+
     // MARK: - Errors
 
     /// An error occurred during the AI response pipeline.

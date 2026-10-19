@@ -69,6 +69,45 @@ final class MenuBarPanelManager: NSObject {
         button.image?.isTemplate = true
         button.action = #selector(statusItemClicked)
         button.target = self
+        // Right-click opens the status-item menu (Home Space, Quit);
+        // left-click keeps toggling the companion panel.
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+    }
+
+    /// Right-click menu on the status item.
+    private func showStatusItemMenu() {
+        let statusItemMenu = NSMenu()
+
+        let homeSpaceItem = NSMenuItem(
+            title: "Open Home Space",
+            action: #selector(openHomeSpaceFromMenu),
+            keyEquivalent: ""
+        )
+        homeSpaceItem.target = self
+        statusItemMenu.addItem(homeSpaceItem)
+
+        statusItemMenu.addItem(.separator())
+
+        let quitItem = NSMenuItem(
+            title: "Quit Clicky",
+            action: #selector(quitClickyFromMenu),
+            keyEquivalent: ""
+        )
+        quitItem.target = self
+        statusItemMenu.addItem(quitItem)
+
+        statusItem?.menu = statusItemMenu
+        statusItem?.button?.performClick(nil)
+        // Remove the menu right after it closes so left-click panel toggling works again
+        statusItem?.menu = nil
+    }
+
+    @objc private func openHomeSpaceFromMenu() {
+        NotificationCenter.default.post(name: .clickyOpenHomeSpace, object: nil)
+    }
+
+    @objc private func quitClickyFromMenu() {
+        NSApp.terminate(nil)
     }
 
     /// Draws the clicky triangle as a menu bar icon. Uses the same shape
@@ -117,6 +156,11 @@ final class MenuBarPanelManager: NSObject {
     }
 
     @objc private func statusItemClicked() {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showStatusItemMenu()
+            return
+        }
+
         if let panel, panel.isVisible {
             hidePanel()
         } else {

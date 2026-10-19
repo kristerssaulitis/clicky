@@ -65,8 +65,44 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
-    // Response text is now displayed inline on the cursor overlay via
-    // streamingResponseText, so no separate response overlay manager is needed.
+
+    // MARK: - Agent platform state (Home Space, agent turns, routines)
+
+    /// All named agents; the default "clicky" agent is auto-created on first launch.
+    let agentStore = AgentProfileStore()
+    /// Per-agent persisted conversations (replaces the old in-memory history array).
+    let conversationStore = ConversationStore()
+    /// Recurring routine tasks per agent, driven by RoutineScheduler.
+    let routineStore = RoutineStore()
+
+    /// The agent the voice push-to-talk flow talks to. Defaults to the
+    /// oldest agent (the auto-created "clicky").
+    @Published var activeAgentID: UUID
+
+    /// Partial assistant text streamed onto the cursor bubble while a
+    /// response is in flight. Nil when idle. Displayed text has any partial
+    /// [POINT:...] tag trimmed off (A4).
+    @Published var streamingResponseText: String?
+
+    /// A shell command awaiting user consent, shown as a card in the panel
+    /// and dashboard. Nil when nothing is pending.
+    @Published var pendingConsent: AgentToolConsentRequest?
+    private var pendingConsentContinuation: CheckedContinuation<AgentToolConsentDecision, Never>?
+
+    /// Per-agent long-lived sessions holding the in-memory API history
+    /// (including tool traffic) for agent-mode turns.
+    private var agentSessionsByAgentID: [UUID: AgentSession] = [:]
+    /// Per-agent in-flight agent-mode turn tasks (dashboard input, routine runs).
+    private var agentTurnTasksByAgentID: [UUID: Task<Void, Never>] = [:]
+
+    /// Live activity line per agent ("running shell…") shown in the dashboard.
+    @Published var agentActivityByAgent: [UUID: String] = [:]
+
+    /// Routine scheduler — created in start() (needs all stores ready).
+    private var routineScheduler: RoutineScheduler?
+
+    /// Circle-to-ask overlay state for the current push-to-talk session.
+    let circleAnnotationSession = CircleAnnotationSession()
 
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
@@ -80,13 +116,13 @@ final class CompanionManager: ObservableObject {
         return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
     }()
 
-    /// Conversation history so Claude remembers prior exchanges within a session.
-    /// Each entry is the user's transcript and Claude's response.
-    private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
-
     /// The currently running AI response task, if any. Cancelled when the user
     /// speaks again so a new response can begin immediately.
     private var currentResponseTask: Task<Void, Never>?
+
+    init() {
+        activeAgentID = agentStore.defaultAgentProfile()?.id ?? UUID()
+    }
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var voiceStateCancellable: AnyCancellable?
@@ -179,6 +215,8 @@ final class CompanionManager: ObservableObject {
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
+        startRoutineScheduler()
+        conversationStore.preloadConversations(agentIDs: agentStore.agents.map(\.id))
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
@@ -292,9 +330,14 @@ final class CompanionManager: ObservableObject {
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
         transientHideTask?.cancel()
+        routineScheduler?.stop()
 
         currentResponseTask?.cancel()
         currentResponseTask = nil
+        for (_, agentTurnTask) in agentTurnTasksByAgentID {
+            agentTurnTask.cancel()
+        }
+        agentTurnTasksByAgentID.removeAll()
         shortcutTransitionCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
@@ -496,6 +539,12 @@ final class CompanionManager: ObservableObject {
             elevenLabsTTSClient.stopPlayback()
             clearDetectedElementLocation()
 
+            // Circle-to-ask: show the drag-to-circle overlay on the cursor's
+            // screen while recording. If the user never drags, it's a no-op.
+            if let cursorScreen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) {
+                circleAnnotationSession.begin(onScreen: cursorScreen)
+            }
+
             // Dismiss the onboarding prompt if it's showing
             if showOnboardingPrompt {
                 withAnimation(.easeOut(duration: 0.3)) {
@@ -534,6 +583,9 @@ final class CompanionManager: ObservableObject {
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
             buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+            // Circle-to-ask overlay only lives during recording; tear it down
+            // here too for empty recordings that never reach the pipeline.
+            circleAnnotationSession.end()
         case .none:
             break
         }
@@ -588,7 +640,6 @@ final class CompanionManager: ObservableObject {
         elevenLabsTTSClient.stopPlayback()
 
         currentResponseTask = Task {
-            // Stay in processing (spinner) state — no streaming text displayed
             voiceState = .processing
 
             do {
@@ -600,27 +651,43 @@ final class CompanionManager: ObservableObject {
                 // Build image labels with the actual screenshot pixel dimensions
                 // so Claude's coordinate space matches the image it sees. We
                 // scale from screenshot pixels to display points ourselves.
-                let labeledImages = screenCaptures.map { capture in
+                var labeledImages = screenCaptures.map { capture in
                     let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
                     return (data: capture.imageData, label: capture.label + dimensionInfo)
                 }
 
-                // Pass conversation history so Claude remembers prior exchanges
-                let historyForAPI = conversationHistory.map { entry in
-                    (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
+                // Circle-to-ask: if the user dragged an ellipse, crop that
+                // region out of the cursor screen capture and attach it as a
+                // labeled image. Then tear the overlay down either way.
+                var circledRegionPromptAddendum = ""
+                if let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }),
+                   let circledImageBlock = circleAnnotationSession.circledRegionImageBlock(fromScreenCapture: cursorScreenCapture) {
+                    labeledImages.append(circledImageBlock)
+                    circledRegionPromptAddendum = "\n\none of the attached images is the region the user circled on their screen while speaking — it marks exactly what they wanted you to look at. prioritize it."
+                    ClickyAnalytics.trackScreenRegionCircled()
                 }
+                circleAnnotationSession.end()
+
+                // Pass conversation history so Claude remembers prior exchanges
+                let historyForAPI = conversationStore.recentExchanges(forAgentID: activeAgentID, maxExchanges: 10)
+                    .map { exchange in
+                        (userPlaceholder: exchange.userText, assistantResponse: exchange.assistantText)
+                    }
 
                 let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
                     images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
+                    systemPrompt: Self.companionVoiceResponseSystemPrompt + circledRegionPromptAddendum,
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
+                    onTextChunk: { [weak self] accumulatedText in
+                        // A4: stream the response onto the cursor bubble with
+                        // any partial [POINT:...] tag trimmed from display
+                        self?.streamingResponseText = Self.displaySafeStreamingText(accumulatedText)
                     }
                 )
 
                 guard !Task.isCancelled else { return }
+                streamingResponseText = nil
 
                 // Parse the [POINT:...] tag from Claude's response
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
@@ -635,86 +702,35 @@ final class CompanionManager: ObservableObject {
                     voiceState = .idle
                 }
 
-                // Pick the screen capture matching Claude's screen number,
-                // falling back to the cursor screen if not specified.
-                let targetScreenCapture: CompanionScreenCapture? = {
-                    if let screenNumber = parseResult.screenNumber,
-                       screenNumber >= 1 && screenNumber <= screenCaptures.count {
-                        return screenCaptures[screenNumber - 1]
-                    }
-                    return screenCaptures.first(where: { $0.isCursorScreen })
-                }()
+                // Fly the buddy if Claude pointed at something
+                applyPointingResultToOverlay(parseResult: parseResult, screenCaptures: screenCaptures)
 
-                if let pointCoordinate = parseResult.coordinate,
-                   let targetScreenCapture {
-                    // Claude's coordinates are in the screenshot's pixel space
-                    // (top-left origin, e.g. 1280x831). Scale to the display's
-                    // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
-                    let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
-                    let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
-                    let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
-                    let displayFrame = targetScreenCapture.displayFrame
-
-                    // Clamp to screenshot coordinate space
-                    let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                    let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-
-                    // Scale from screenshot pixels to display points
-                    let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                    let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
-                    let appKitY = displayHeight - displayLocalY
-
-                    // Convert display-local coords to global screen coords
-                    let globalLocation = CGPoint(
-                        x: displayLocalX + displayFrame.origin.x,
-                        y: appKitY + displayFrame.origin.y
-                    )
-
-                    detectedElementScreenLocation = globalLocation
-                    detectedElementDisplayFrame = displayFrame
-                    ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
-                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
-                } else {
-                    print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
-                }
-
-                // Save this exchange to conversation history (with the point tag
-                // stripped so it doesn't confuse future context)
-                conversationHistory.append((
-                    userTranscript: transcript,
-                    assistantResponse: spokenText
-                ))
-
-                // Keep only the last 10 exchanges to avoid unbounded context growth
-                if conversationHistory.count > 10 {
-                    conversationHistory.removeFirst(conversationHistory.count - 10)
-                }
-
-                print("🧠 Conversation history: \(conversationHistory.count) exchanges")
+                // Save this exchange to the agent's persisted conversation (with
+                // the point tag stripped so it doesn't confuse future context)
+                conversationStore.appendMessage(
+                    ConversationMessage(role: .user, text: transcript),
+                    toAgentConversation: activeAgentID
+                )
+                conversationStore.appendMessage(
+                    ConversationMessage(role: .assistant, text: spokenText, pointTag: Self.rawPointTag(from: parseResult)),
+                    toAgentConversation: activeAgentID
+                )
 
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 
                 // Play the response via TTS. Keep the spinner (processing state)
                 // until the audio actually starts playing, then switch to responding.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    do {
-                        try await elevenLabsTTSClient.speakText(spokenText)
-                        // speakText returns after player.play() — audio is now playing
-                        voiceState = .responding
-                    } catch {
-                        ClickyAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
-                    }
+                    await speakResponseText(spokenText)
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
+                circleAnnotationSession.end()
             } catch {
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
+                streamingResponseText = nil
+                circleAnnotationSession.end()
                 speakCreditsErrorFallback()
             }
 
@@ -725,8 +741,72 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// If the cursor is in transient mode (user toggled "Show Clicky" off),
-    /// waits for TTS playback and any pointing animation to finish, then
+    /// Plays response text via ElevenLabs TTS with the credits-error fallback.
+    /// Shared by the voice path and agent turns.
+    private func speakResponseText(_ spokenText: String) async {
+        do {
+            try await elevenLabsTTSClient.speakText(spokenText)
+            // speakText returns after player.play() — audio is now playing
+            voiceState = .responding
+        } catch {
+            ClickyAnalytics.trackTTSError(error: error.localizedDescription)
+            print("⚠️ ElevenLabs TTS error: \(error)")
+            speakCreditsErrorFallback()
+        }
+    }
+
+    /// Converts a [POINT:...] parse result into the buddy's flight animation.
+    /// Shared by the voice path and agent turns.
+    private func applyPointingResultToOverlay(parseResult: PointingParseResult, screenCaptures: [CompanionScreenCapture]) {
+        // Pick the screen capture matching Claude's screen number,
+        // falling back to the cursor screen if not specified.
+        let targetScreenCapture: CompanionScreenCapture? = {
+            if let screenNumber = parseResult.screenNumber,
+               screenNumber >= 1 && screenNumber <= screenCaptures.count {
+                return screenCaptures[screenNumber - 1]
+            }
+            return screenCaptures.first(where: { $0.isCursorScreen })
+        }()
+
+        guard let pointCoordinate = parseResult.coordinate,
+              let targetScreenCapture else {
+            print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
+            return
+        }
+
+        // Claude's coordinates are in the screenshot's pixel space
+        // (top-left origin, e.g. 1280x831). Scale to the display's
+        // point space (e.g. 1512x982), then convert to AppKit global coords.
+        let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
+        let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
+        let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
+        let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
+        let displayFrame = targetScreenCapture.displayFrame
+
+        // Clamp to screenshot coordinate space
+        let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
+        let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
+
+        // Scale from screenshot pixels to display points
+        let displayLocalX = clampedX * (displayWidth / screenshotWidth)
+        let displayLocalY = clampedY * (displayHeight / screenshotHeight)
+
+        // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
+        let appKitY = displayHeight - displayLocalY
+
+        // Convert display-local coords to global screen coords
+        let globalLocation = CGPoint(
+            x: displayLocalX + displayFrame.origin.x,
+            y: appKitY + displayFrame.origin.y
+        )
+
+        detectedElementScreenLocation = globalLocation
+        detectedElementDisplayFrame = displayFrame
+        ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
+        print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
+    }
+
+    /// If the cursor is in transient mode (user toggled "Show Clicky" off),    /// waits for TTS playback and any pointing animation to finish, then
     /// fades out the overlay after a 1-second pause. Cancelled automatically
     /// if the user starts another push-to-talk interaction.
     private func scheduleTransientHideIfNeeded() {
@@ -766,6 +846,14 @@ final class CompanionManager: ObservableObject {
     }
 
     // MARK: - Point Tag Parsing
+
+    /// Rebuilds the raw [POINT:...] tag from a parse result so it can be kept
+    /// on a stored ConversationMessage. Nil when Claude didn't point.
+    static func rawPointTag(from parseResult: PointingParseResult) -> String? {
+        guard let coordinate = parseResult.coordinate else { return nil }
+        let screenSuffix = parseResult.screenNumber.map { ":screen\($0)" } ?? ""
+        return "[POINT:\(Int(coordinate.x)),\(Int(coordinate.y)):\(parseResult.elementLabel ?? "element")\(screenSuffix)]"
+    }
 
     /// Result of parsing a [POINT:...] tag from Claude's response.
     struct PointingParseResult {
@@ -1022,5 +1110,219 @@ final class CompanionManager: ObservableObject {
                 print("⚠️ Onboarding demo error: \(error)")
             }
         }
+    }
+}
+
+// MARK: - Agent Platform (Home Space turns, tool loop, consent, routines)
+
+extension CompanionManager {
+
+    // MARK: Streaming text display (A4)
+
+    /// Makes partial streamed text safe to show on the cursor bubble: strips
+    /// complete [POINT:...] tags and any trailing partial tag that hasn't
+    /// closed yet, plus <ROUTINE> tags.
+    static func displaySafeStreamingText(_ streamedText: String) -> String {
+        var displayText = streamedText
+        if let regex = try? NSRegularExpression(pattern: #"\[POINT:[^\]]*\]?"#) {
+            let fullRange = NSRange(displayText.startIndex..., in: displayText)
+            displayText = regex.stringByReplacingMatches(in: displayText, options: [], range: fullRange, withTemplate: "")
+        }
+        if let regex = try? NSRegularExpression(pattern: #"<ROUTINE>.*?(</ROUTINE>)?"#, options: [.dotMatchesLineSeparators]) {
+            let fullRange = NSRange(displayText.startIndex..., in: displayText)
+            displayText = regex.stringByReplacingMatches(in: displayText, options: [], range: fullRange, withTemplate: "")
+        }
+        return displayText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: Consent
+
+    /// Consent handler installed on every AgentToolExecutor. Pauses the tool
+    /// loop, shows the card in panel + dashboard, and awaits the user.
+    private func waitForConsent(_ consentRequest: AgentToolConsentRequest) async -> AgentToolConsentDecision {
+        await withCheckedContinuation { continuation in
+            pendingConsentContinuation = continuation
+            pendingConsent = consentRequest
+        }
+    }
+
+    /// Resolves the pending consent card. Called by the panel/dashboard buttons.
+    func resolveConsent(_ decision: AgentToolConsentDecision) {
+        pendingConsent = nil
+        pendingConsentContinuation?.resume(returning: decision)
+        pendingConsentContinuation = nil
+    }
+
+    // MARK: Agent sessions
+
+    /// Long-lived session per agent, caching the in-memory API history.
+    private func agentSession(forAgentID agentID: UUID) -> AgentSession? {
+        guard let agentProfile = agentStore.profile(forAgentID: agentID) else { return nil }
+
+        if let existingSession = agentSessionsByAgentID[agentID] {
+            return existingSession
+        }
+
+        let toolExecutor = AgentToolExecutor(
+            workspaceURL: AgentProfileStore.workspaceURL(forAgentID: agentID),
+            agentName: agentProfile.name
+        )
+        toolExecutor.consentHandler = { [weak self] consentRequest in
+            guard let self else { return .deny }
+            return await self.waitForConsent(consentRequest)
+        }
+
+        let newSession = AgentSession(
+            agentProfile: agentProfile,
+            claudeAPI: claudeAPI,
+            toolExecutor: toolExecutor,
+            conversationStore: conversationStore
+        )
+        newSession.onActivityChange = { [weak self] activityDescription in
+            guard let self else { return }
+            if let activityDescription {
+                self.agentActivityByAgent[agentID] = activityDescription
+            } else {
+                self.agentActivityByAgent[agentID] = nil
+            }
+        }
+        agentSessionsByAgentID[agentID] = newSession
+        return newSession
+    }
+
+    // MARK: Dashboard text turns (B5b)
+
+    /// Whether an agent-mode turn is currently running for this agent.
+    func isAgentTurnRunning(agentID: UUID) -> Bool {
+        agentTurnTasksByAgentID[agentID] != nil
+    }
+
+    /// Live activity line for the dashboard ("running shell…").
+    func agentActivityDescription(agentID: UUID) -> String? {
+        agentActivityByAgent[agentID]
+    }
+
+    /// Sends a typed message from the Home Space conversation view through
+    /// the agent pipeline (screenshots attached, tools enabled, TTS + cursor
+    /// bubble on the final text).
+    func sendDashboardText(agentID: UUID, text: String) {
+        guard agentTurnTasksByAgentID[agentID] == nil else { return }
+
+        let turnTask = Task {
+            await runAgentTurn(
+                agentID: agentID,
+                userText: text,
+                systemNote: nil,
+                includeScreenshots: true
+            )
+        }
+        agentTurnTasksByAgentID[agentID] = turnTask
+    }
+
+    /// The full agent-mode turn: loop, routine commands, pointing, TTS.
+    private func runAgentTurn(
+        agentID: UUID,
+        userText: String,
+        systemNote: String?,
+        includeScreenshots: Bool
+    ) async {
+        guard let agentSession = agentSession(forAgentID: agentID) else { return }
+
+        var screenCaptures: [CompanionScreenCapture] = []
+        if includeScreenshots {
+            do {
+                screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+            } catch {
+                print("⚠️ Agent turn: screenshot capture failed, continuing text-only: \(error)")
+            }
+        }
+
+        do {
+            let turnResult = try await agentSession.runTurn(
+                userText: userText,
+                screenCaptures: screenCaptures,
+                systemNote: systemNote,
+                onStreamingText: { [weak self] partialText in
+                    self?.streamingResponseText = Self.displaySafeStreamingText(partialText)
+                }
+            )
+            streamingResponseText = nil
+            agentActivityByAgent[agentID] = nil
+
+            // Apply any <ROUTINE> commands the agent requested
+            for routineCommand in turnResult.routineCommands {
+                routineStore.applyRoutineCommand(routineCommand, agentID: agentID)
+            }
+
+            // Fly the buddy if the agent pointed at something
+            if turnResult.pointingResult.coordinate != nil,
+               let screenCaptures = agentSession.lastTurnScreenCaptures {
+                applyPointingResultToOverlay(parseResult: turnResult.pointingResult, screenCaptures: screenCaptures)
+            }
+
+            // Speak the final text on the cursor bubble
+            if !turnResult.displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                await speakResponseText(turnResult.displayText)
+            }
+        } catch is CancellationError {
+            agentActivityByAgent[agentID] = nil
+        } catch {
+            streamingResponseText = nil
+            agentActivityByAgent[agentID] = nil
+            print("⚠️ Agent turn error: \(error)")
+            conversationStore.appendMessage(
+                ConversationMessage(role: .assistant, text: "something went wrong: \(error.localizedDescription)"),
+                toAgentConversation: agentID
+            )
+        }
+
+        agentTurnTasksByAgentID[agentID] = nil
+    }
+
+    // MARK: Routines (B4)
+
+    private func startRoutineScheduler() {
+        routineScheduler = RoutineScheduler(
+            routineStore: routineStore,
+            agentProfileStore: agentStore
+        ) { [weak self] agentID, routine in
+            await self?.runRoutineTurn(agentID: agentID, routine: routine)
+        }
+        routineScheduler?.start()
+    }
+
+    /// One routine run: an agent-mode turn in that agent's conversation with
+    /// a system note, result spoken on the cursor bubble.
+    private func runRoutineTurn(agentID: UUID, routine: Routine) async {
+        guard agentTurnTasksByAgentID[agentID] == nil else { return }
+
+        let turnTask = Task {
+            await runAgentTurn(
+                agentID: agentID,
+                userText: routine.task,
+                systemNote: "routine run for \"\(routine.title)\" (runs every \(routine.everyMinutes) min) — report only what's new since last time",
+                includeScreenshots: false
+            )
+        }
+        agentTurnTasksByAgentID[agentID] = turnTask
+    }
+
+    /// Dashboard "run now" button.
+    func runRoutineNow(agentID: UUID, routine: Routine) {
+        guard agentTurnTasksByAgentID[agentID] == nil else { return }
+        routineStore.setLastRunAt(Date(), forRoutineID: routine.id, agentID: agentID)
+        Task {
+            await runRoutineTurn(agentID: agentID, routine: routine)
+        }
+    }
+
+    /// Dashboard pause/resume.
+    func setRoutinePaused(agentID: UUID, routineID: UUID, isPaused: Bool) {
+        routineStore.setRoutinePaused(routineID: routineID, isPaused: isPaused, agentID: agentID)
+    }
+
+    /// Dashboard delete.
+    func deleteRoutine(agentID: UUID, routineID: UUID) {
+        routineStore.deleteRoutine(routineID: routineID, agentID: agentID)
     }
 }

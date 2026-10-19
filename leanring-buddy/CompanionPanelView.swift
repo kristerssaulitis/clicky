@@ -21,6 +21,19 @@ struct CompanionPanelView: View {
                 .background(DS.Colors.borderSubtle)
                 .padding(.horizontal, 16)
 
+            // Consent card — floats above the rest while a shell command
+            // awaits approval (B1)
+            if let pendingConsent = companionManager.pendingConsent {
+                ConsentCardView(
+                    consentRequest: pendingConsent,
+                    onDecision: { decision in
+                        companionManager.resolveConsent(decision)
+                    }
+                )
+                .padding(.top, 12)
+                .padding(.horizontal, 16)
+            }
+
             permissionsCopySection
                 .padding(.top, 16)
                 .padding(.horizontal, 16)
@@ -28,6 +41,12 @@ struct CompanionPanelView: View {
             if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
                 Spacer()
                     .frame(height: 12)
+
+                openHomeSpaceRow
+                    .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 8)
 
                 modelPickerRow
                     .padding(.horizontal, 16)
@@ -594,6 +613,44 @@ struct CompanionPanelView: View {
                 .foregroundColor(DS.Colors.textTertiary)
         }
         .padding(.vertical, 4)
+    }
+
+    // MARK: - Open Home Space
+
+    private var openHomeSpaceRow: some View {
+        Button(action: {
+            NotificationCenter.default.post(name: .clickyOpenHomeSpace, object: nil)
+            NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+        }) {
+            HStack(spacing: 8) {
+                Image(systemName: "square.grid.2x2")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .frame(width: 16)
+
+                Text("Open Home Space")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+
+                Spacer()
+
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
     }
 
     // MARK: - Model Picker

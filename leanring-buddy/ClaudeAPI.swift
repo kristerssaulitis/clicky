@@ -5,6 +5,44 @@
 
 import Foundation
 
+/// One tool_use block returned by Claude in an agent turn.
+struct ClaudeToolUseBlock {
+    /// Tool use ID from the API — must be echoed back in the tool_result block.
+    let toolUseID: String
+    let toolName: String
+    /// The tool input as a raw JSON string (accumulated from input_json_delta).
+    let inputJSONString: String
+}
+
+/// One assistant content block (text or tool_use) from an agent turn,
+/// in the shape needed to echo it back in the next API message.
+enum ClaudeResponseBlock {
+    case text(String)
+    case toolUse(ClaudeToolUseBlock)
+}
+
+/// Result of one agent turn: the text blocks and tool_use blocks Claude
+/// produced, plus the stop reason ("end_turn" or "tool_use").
+struct ClaudeAgentTurnResult {
+    let responseBlocks: [ClaudeResponseBlock]
+    let stopReason: String?
+
+    /// All text concatenated (for display/TTS).
+    var text: String {
+        responseBlocks.compactMap {
+            if case let .text(textBlock) = $0 { return textBlock }
+            return nil
+        }.joined()
+    }
+
+    var toolUses: [ClaudeToolUseBlock] {
+        responseBlocks.compactMap {
+            if case let .toolUse(toolUseBlock) = $0 { return toolUseBlock }
+            return nil
+        }
+    }
+}
+
 /// Claude API helper with streaming for progressive text display.
 class ClaudeAPI {
     private static let tlsWarmupLock = NSLock()
@@ -209,6 +247,127 @@ class ClaudeAPI {
 
         let duration = Date().timeIntervalSince(startTime)
         return (text: accumulatedResponseText, duration: duration)
+    }
+
+    /// Sends one agent turn with tool definitions and streams the response.
+    /// Extends the SSE parser beyond analyzeImageStreaming to track
+    /// tool_use blocks (content_block_start + input_json_delta) alongside text.
+    /// Returns the response blocks and stop reason; the caller executes tools
+    /// and calls again with tool_result messages appended to `messages`.
+    func sendAgentTurn(
+        messages: [[String: Any]],
+        tools: [[String: Any]],
+        systemPrompt: String,
+        onTextChunk: @MainActor @Sendable (String) -> Void
+    ) async throws -> ClaudeAgentTurnResult {
+        var request = makeAPIRequest()
+
+        let body: [String: Any] = [
+            "model": model,
+            "max_tokens": 4096,
+            "stream": true,
+            "system": systemPrompt,
+            "tools": tools,
+            "messages": messages
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (byteStream, response) = try await session.bytes(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw NSError(domain: "ClaudeAPI", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response"])
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            var errorBodyChunks: [String] = []
+            for try await line in byteStream.lines {
+                errorBodyChunks.append(line)
+            }
+            throw NSError(
+                domain: "ClaudeAPI",
+                code: httpResponse.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: "API Error (\(httpResponse.statusCode)): \(errorBodyChunks.joined(separator: "\n"))"]
+            )
+        }
+
+        var responseBlocks: [ClaudeResponseBlock] = []
+        var stopReason: String? = nil
+        // Accumulator for the tool_use block currently being streamed
+        var pendingToolUseID: String? = nil
+        var pendingToolUseName: String? = nil
+        var pendingToolUseInputJSON = ""
+        var accumulatedTextSoFar = ""
+
+        for try await line in byteStream.lines {
+            guard line.hasPrefix("data: ") else { continue }
+            let jsonString = String(line.dropFirst(6))
+            guard jsonString != "[DONE]" else { break }
+
+            guard let jsonData = jsonString.data(using: .utf8),
+                  let eventPayload = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let eventType = eventPayload["type"] as? String else {
+                continue
+            }
+
+            switch eventType {
+            case "content_block_start":
+                guard let contentBlock = eventPayload["content_block"] as? [String: Any],
+                      let blockType = contentBlock["type"] as? String else { continue }
+
+                if blockType == "tool_use" {
+                    // Flush any text block that came before this tool call
+                    if !accumulatedTextSoFar.isEmpty {
+                        responseBlocks.append(.text(accumulatedTextSoFar))
+                        accumulatedTextSoFar = ""
+                    }
+                    pendingToolUseID = contentBlock["id"] as? String
+                    pendingToolUseName = contentBlock["name"] as? String
+                    pendingToolUseInputJSON = ""
+                }
+
+            case "content_block_delta":
+                guard let delta = eventPayload["delta"] as? [String: Any],
+                      let deltaType = delta["type"] as? String else { continue }
+
+                if deltaType == "text_delta", let textChunk = delta["text"] as? String {
+                    accumulatedTextSoFar += textChunk
+                    let currentAccumulatedText = accumulatedTextSoFar
+                    await onTextChunk(currentAccumulatedText)
+                } else if deltaType == "input_json_delta",
+                          pendingToolUseID != nil,
+                          let partialJSON = delta["partial_json"] as? String {
+                    pendingToolUseInputJSON += partialJSON
+                }
+
+            case "content_block_stop":
+                if let toolUseID = pendingToolUseID, let toolName = pendingToolUseName {
+                    responseBlocks.append(.toolUse(ClaudeToolUseBlock(
+                        toolUseID: toolUseID,
+                        toolName: toolName,
+                        inputJSONString: pendingToolUseInputJSON
+                    )))
+                    pendingToolUseID = nil
+                    pendingToolUseName = nil
+                    pendingToolUseInputJSON = ""
+                }
+
+            case "message_delta":
+                if let delta = eventPayload["delta"] as? [String: Any],
+                   let deltaStopReason = delta["stop_reason"] as? String {
+                    stopReason = deltaStopReason
+                }
+
+            default:
+                break
+            }
+        }
+
+        if !accumulatedTextSoFar.isEmpty {
+            responseBlocks.append(.text(accumulatedTextSoFar))
+        }
+
+        return ClaudeAgentTurnResult(responseBlocks: responseBlocks, stopReason: stopReason)
     }
 
     /// Non-streaming fallback for validation requests where we don't need progressive display.
