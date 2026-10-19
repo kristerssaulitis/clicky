@@ -33,9 +33,12 @@ struct HomeSpaceContent: View {
     @ObservedObject var conversationStore: ConversationStore
     @ObservedObject var routineStore: RoutineStore
     @State private var isShowingNewAgentSheet = false
+    // Drives pre-navigation: the panel posts .clickyOpenHomeSpace with an
+    // agent ID and this stack jumps straight to that conversation.
+    @State private var navigationPath: [UUID] = []
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $navigationPath) {
             List {
                 Section("AGENTS") {
                     ForEach(agentStore.agents) { agentProfile in
@@ -121,6 +124,13 @@ struct HomeSpaceContent: View {
                     .padding(24)
                 }
             }
+            .onReceive(NotificationCenter.default.publisher(for: .clickyOpenHomeSpace)) { notification in
+                // Panel rows pass the agent's UUID; a nil object (expand icon,
+                // status-item menu) keeps the current screen.
+                if let agentID = notification.object as? UUID {
+                    navigationPath = [agentID]
+                }
+            }
         }
     }
 
@@ -134,6 +144,10 @@ struct HomeSpaceContent: View {
 struct AgentRowView: View {
     let agentProfile: AgentProfile
     let lastMessage: ConversationMessage?
+    // Optional so existing Home Space call sites stay untouched; the panel's
+    // agent list passes both.
+    var isActive: Bool = false
+    var isTurnRunning: Bool = false
 
     private let relativeFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
@@ -143,6 +157,13 @@ struct AgentRowView: View {
 
     var body: some View {
         HStack(spacing: 10) {
+            // Blue dot marks the agent the voice hotkey currently targets
+            if isActive {
+                Circle()
+                    .fill(DS.Colors.blue400)
+                    .frame(width: 7, height: 7)
+            }
+
             AvatarCircleView(agentProfile: agentProfile, diameter: 34)
 
             VStack(alignment: .leading, spacing: 2) {
@@ -168,6 +189,11 @@ struct AgentRowView: View {
                 Text(relativeFormatter.localizedString(for: lastMessage.timestamp, relativeTo: Date()))
                     .font(.system(size: 11))
                     .foregroundColor(DS.Colors.textTertiary)
+            }
+
+            if isTurnRunning {
+                ProgressView()
+                    .scaleEffect(0.6)
             }
         }
         .padding(.vertical, 2)
