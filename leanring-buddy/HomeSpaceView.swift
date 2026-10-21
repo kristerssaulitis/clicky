@@ -7,6 +7,7 @@
 //  activating window (see HomeSpaceWindowManager).
 //
 
+import Combine
 import SwiftUI
 
 // MARK: - Root dashboard

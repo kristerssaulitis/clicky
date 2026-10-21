@@ -12,6 +12,7 @@
 //  caps are what keeps the agent polite; the sandbox being off is documented.
 //
 
+import Combine
 import Foundation
 
 /// A shell command awaiting user consent.

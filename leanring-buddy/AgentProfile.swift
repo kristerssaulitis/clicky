@@ -8,6 +8,7 @@
 //  folder so the whole agent is one directory you can inspect or delete.
 //
 
+import Combine
 import Foundation
 import SwiftUI
 

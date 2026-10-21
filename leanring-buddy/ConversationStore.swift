@@ -7,6 +7,7 @@
 //  as observable state. Replaces CompanionManager's in-memory history array.
 //
 
+import Combine
 import Foundation
 import SwiftUI
 
