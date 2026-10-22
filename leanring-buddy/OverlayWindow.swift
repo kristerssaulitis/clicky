@@ -336,6 +336,30 @@ struct BlueCursorView: View {
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
 
+            // A4: response text streamed onto the cursor while Claude generates.
+            // Partial [POINT:...] tags are already stripped by CompanionManager.
+            if isCursorOnThisScreen,
+               let streamingResponseText = companionManager.streamingResponseText,
+               !streamingResponseText.isEmpty {
+                Text(streamingResponseText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white)
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(8)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .frame(maxWidth: 260, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(DS.Colors.overlayCursorBlue.opacity(0.92))
+                            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.4), radius: 8, x: 0, y: 0)
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
+                    .position(x: cursorPosition.x + 10 + 130, y: cursorPosition.y + 18 + 44)
+                    .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
+                    .allowsHitTesting(false)
+            }
+
         }
         .frame(width: screenFrame.width, height: screenFrame.height)
         .ignoresSafeArea()

@@ -21,6 +21,19 @@ struct CompanionPanelView: View {
                 .background(DS.Colors.borderSubtle)
                 .padding(.horizontal, 16)
 
+            // Consent card — floats above the rest while a shell command
+            // awaits approval (B1)
+            if let pendingConsent = companionManager.pendingConsent {
+                ConsentCardView(
+                    consentRequest: pendingConsent,
+                    onDecision: { decision in
+                        companionManager.resolveConsent(decision)
+                    }
+                )
+                .padding(.top, 12)
+                .padding(.horizontal, 16)
+            }
+
             permissionsCopySection
                 .padding(.top, 16)
                 .padding(.horizontal, 16)
@@ -28,6 +41,12 @@ struct CompanionPanelView: View {
             if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
                 Spacer()
                     .frame(height: 12)
+
+                agentListSection
+                    .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 8)
 
                 modelPickerRow
                     .padding(.horizontal, 16)
@@ -57,14 +76,6 @@ struct CompanionPanelView: View {
             //     showClickyCursorToggleRow
             //         .padding(.horizontal, 16)
             // }
-
-            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-                Spacer()
-                    .frame(height: 16)
-
-                dmFarzaButton
-                    .padding(.horizontal, 16)
-            }
 
             Spacer()
                 .frame(height: 12)
@@ -596,6 +607,77 @@ struct CompanionPanelView: View {
         .padding(.vertical, 4)
     }
 
+    // MARK: - Agent List
+
+    /// Scrollable agent list shown in the onboarded panel. Each row taps
+    /// through to that agent's conversation in Home Space; the expand icon
+    /// opens Home Space on the list screen. Wrapped in a TimelineView so the
+    /// relative timestamps refresh each minute without manual timers.
+    private var agentListSection: some View {
+        VStack(spacing: 6) {
+            TimelineView(.periodic(from: .now, by: 60)) { _ in
+                ScrollView {
+                    VStack(spacing: 2) {
+                        ForEach(companionManager.agentStore.agents) { agentProfile in
+                            agentRowButton(agentProfile: agentProfile)
+                        }
+                    }
+                    .padding(4)
+                }
+                // Cap the height so many agents scroll instead of growing the
+                // panel unbounded (panel height auto-snaps to fittingSize)
+                .frame(maxHeight: 320)
+            }
+
+            HStack {
+                Spacer()
+
+                Button(action: {
+                    NotificationCenter.default.post(name: .clickyOpenHomeSpace, object: nil)
+                    NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+                }) {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .frame(width: 24, height: 24)
+                        .background(
+                            Circle()
+                                .fill(Color.white.opacity(0.08))
+                        )
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+                .help("Open Home Space")
+            }
+        }
+    }
+
+    private func agentRowButton(agentProfile: AgentProfile) -> some View {
+        Button(action: {
+            // Make this agent the voice target, then open Home Space
+            // pre-navigated to its conversation
+            companionManager.activeAgentID = agentProfile.id
+            NotificationCenter.default.post(name: .clickyOpenHomeSpace, object: agentProfile.id)
+            NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+        }) {
+            AgentRowView(
+                agentProfile: agentProfile,
+                lastMessage: companionManager.conversationStore
+                    .activeConversation(forAgentID: agentProfile.id).messages.last,
+                isActive: agentProfile.id == companionManager.activeAgentID,
+                isTurnRunning: companionManager.agentActivityByAgent[agentProfile.id] != nil
+            )
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                    .fill(Color.white.opacity(0.04))
+            )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
     // MARK: - Model Picker
 
     private var modelPickerRow: some View {
@@ -636,43 +718,6 @@ struct CompanionPanelView: View {
                     RoundedRectangle(cornerRadius: 5, style: .continuous)
                         .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
                 )
-        }
-        .buttonStyle(.plain)
-        .pointerCursor()
-    }
-
-    // MARK: - DM Farza Button
-
-    private var dmFarzaButton: some View {
-        Button(action: {
-            if let url = URL(string: "https://x.com/farzatv") {
-                NSWorkspace.shared.open(url)
-            }
-        }) {
-            HStack(spacing: 8) {
-                Image(systemName: "bubble.left.fill")
-                    .font(.system(size: 12, weight: .medium))
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Got feedback? DM me")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text("Bugs, ideas, anything — I read every message.")
-                        .font(.system(size: 10))
-                        .foregroundColor(DS.Colors.textTertiary)
-                }
-            }
-            .foregroundColor(DS.Colors.textSecondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-            )
         }
         .buttonStyle(.plain)
         .pointerCursor()
